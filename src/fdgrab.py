@@ -1,22 +1,31 @@
-"""FreeDrama / Kuku TV downloader.
+"""fdgrab — FreeDrama / Kuku TV downloader.
 
-    python fdgrab.py catalog              # channels + episode counts -> catalog.json
-    python fdgrab.py index <channel_id>   # episode list for one channel
-    python fdgrab.py index-all
-    python fdgrab.py get <channel_id> [--eps 1-5] [--limit 3]
-    python fdgrab.py status
+    python fdgrab.py discover                # catalog: series + home rails
+    python fdgrab.py discover --genres       # + every genre (slow, thorough)
+    python fdgrab.py index <show>            # episode list for one show
+    python fdgrab.py index-all               # every show in the catalog
+    python fdgrab.py info <show>             # show details, no download
+    python fdgrab.py get <show> --eps 1-5    # download a range
+    python fdgrab.py get <show> --all        # the whole show
+    python fdgrab.py get-all --limit-shows 3 # batch, first N shows
+    python fdgrab.py search "love"           # search and print ids
+    python fdgrab.py status                  # what is on disk
 
-Media is HLS on `media.cdn.kukufm.com`, behind CloudFront signed cookies that the
-API hands out per session. ffmpeg pulls the manifest and the segments once the
-cookie header is passed with `-headers`.
+<show> is a numeric channel id or a show slug.
+
+Media is HLS behind CloudFront signed cookies; the cookie is fetched once and
+refreshed every 20 minutes. State lives in state/<channel>.json so re-running only
+fetches the gaps.
 """
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import re
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -31,10 +40,11 @@ for d in (OUT, STATE):
     d.mkdir(exist_ok=True)
 
 FFMPEG = "ffmpeg"
-COOKIE_TTL = 20 * 60          # refresh the CDN cookie every 20 minutes
-_cookie_cache: dict = {"ts": 0.0, "header": ""}
+COOKIE_TTL = 20 * 60
+_cookie = {"ts": 0.0, "header": "", "lock": threading.Lock()}
 
 
+# ------------------------------------------------------------------ helpers
 def slugify(s: str) -> str:
     s = re.sub(r"[\\/:*?\"<>|\r\n\t]+", " ", s or "")
     s = re.sub(r"\s+", " ", s).strip()
@@ -57,82 +67,114 @@ def save_json(p: Path, obj) -> None:
 
 
 def cookie_header() -> str:
-    if time.time() - _cookie_cache["ts"] < COOKIE_TTL and _cookie_cache["header"]:
-        return _cookie_cache["header"]
-    header = fdapi.cookie_header(fdapi.cdn_cookies())
-    _cookie_cache.update({"ts": time.time(), "header": header})
-    return header
+    with _cookie["lock"]:
+        if time.time() - _cookie["ts"] < COOKIE_TTL and _cookie["header"]:
+            return _cookie["header"]
+        header = fdapi.cookie_header(fdapi.cdn_cookies())
+        _cookie.update({"ts": time.time(), "header": header})
+        return header
 
 
-# ------------------------------------------------------------------ catalog
-def walk_shows(obj, out=None):
-    """Collect {slug, title?, id} show refs from any home-feed shape."""
-    out = out if out is not None else []
-    if isinstance(obj, dict):
-        uri = obj.get("uri")
-        if isinstance(uri, str) and "kukufm/show/" in uri:
-            slug = uri.rstrip("/").split("/")[-1]
-            out.append({
-                "slug": slug,
-                "title": obj.get("title") or obj.get("name"),
-                "id": obj.get("item_id") or obj.get("id"),
-                "image": obj.get("image"),
-            })
-        for v in obj.values():
-            walk_shows(v, out)
-    elif isinstance(obj, list):
-        for v in obj:
-            walk_shows(v, out)
-    return out
+def resolve_channel(ref):
+    """Accept a numeric id or a slug; slugs go through the API where possible."""
+    if str(ref).isdigit():
+        return int(ref)
+    cat = load_json(CATALOG, [])
+    for row in cat:
+        if row.get("slug") == ref and row.get("id"):
+            return int(row["id"])
+    try:
+        d = fdapi.slug_map(ref, "show")
+        for key in ("id", "item_id", "channel_id"):
+            if isinstance(d, dict) and d.get(key):
+                return int(d[key])
+    except fdapi.ApiError:
+        pass
+    raise SystemExit("cannot resolve show %r — try a numeric channel id" % ref)
 
 
-def resolve_channel(slug_or_id):
-    """The home feed gives slugs; episode lists need numeric channel ids."""
-    if str(slug_or_id).isdigit():
-        return int(slug_or_id)
-    d = fdapi.get("/api/v1.0/utility/slug_mapper/",
-                  {"item_type": "show", "slug": slug_or_id})
-    for key in ("id", "item_id", "channel_id"):
-        if isinstance(d, dict) and d.get(key):
-            return int(d[key])
-    if isinstance(d, dict) and isinstance(d.get("channel"), dict):
-        return int(d["channel"]["id"])
-    raise RuntimeError("cannot resolve channel for %r: %s" % (slug_or_id, str(d)[:200]))
-
-
-def cmd_catalog(_args) -> None:
-    # v2.3 carries item_id (channel id); v3 only carries slugs.
-    refs = walk_shows(fdapi.get("/api/v2.3/home/all/"))
-    if not any(r.get("id") for r in refs):
-        refs = walk_shows(fdapi.home_all())
-    seen, rows = set(), []
+# ------------------------------------------------------------------ discovery
+def _add(rows: dict, refs):
     for r in refs:
-        if not r["slug"] or r["slug"] in seen:
+        if not r.get("slug"):
             continue
-        seen.add(r["slug"])
-        rows.append(r)
-    save_json(CATALOG, rows)
-    print("catalog: %d shows (%d with channel ids) -> %s"
-          % (len(rows), sum(1 for r in rows if r.get("id")), CATALOG))
-    for r in rows[:12]:
-        print("  %-46s %s" % (r["slug"][:46], r.get("id") or ""))
+        cur = rows.get(r["slug"])
+        if cur is None:
+            rows[r["slug"]] = r
+        elif not cur.get("id") and r.get("id"):
+            rows[r["slug"]] = r
 
 
-def cmd_index(args) -> None:
-    cid = resolve_channel(args.channel)
-    first = fdapi.channel_episodes(cid, 1, 20)
+def cmd_discover(args) -> None:
+    rows: dict[str, dict] = {}
+
+    print("home rails…")
+    for page in range(1, 4):
+        try:
+            _add(rows, fdapi.walk_shows(fdapi.home_ids(page)))
+            _add(rows, fdapi.walk_shows(fdapi.home(page)))
+        except fdapi.ApiError as e:
+            print("  page %d: %s" % (page, e.status))
+            break
+
+    print("series content type…")
+    for page in range(1, 31):
+        try:
+            d = fdapi.content_type_shows("series", page, 20)
+        except fdapi.ApiError as e:
+            print("  page %d: %s" % (page, e.status))
+            break
+        shows = d.get("shows") or []
+        for s in shows:
+            _add(rows, [{"slug": s.get("slug"), "id": s.get("id"),
+                         "title": s.get("title"), "image": s.get("image"),
+                         "episodes": s.get("n_episodes")}])
+        if not d.get("has_next") or not shows:
+            break
+
+    if args.genres:
+        print("every genre…")
+        for g in fdapi.genres():
+            for page in range(1, args.max_pages + 1):
+                try:
+                    d = fdapi.genre_shows(g["slug"], page)
+                except fdapi.ApiError:
+                    break
+                shows = d.get("cu_shows") or []
+                for s in shows:
+                    _add(rows, [{"slug": s.get("slug"), "id": s.get("id"),
+                                 "title": s.get("title"), "image": s.get("image"),
+                                 "episodes": s.get("n_episodes")}])
+                if not d.get("has_next") or not shows:
+                    break
+
+    out = sorted(rows.values(), key=lambda r: (r.get("title") or r["slug"]).lower())
+    save_json(CATALOG, out)
+    with_id = sum(1 for r in out if r.get("id"))
+    print("\ncatalog: %d shows (%d with channel ids) -> %s"
+          % (len(out), with_id, CATALOG))
+    for r in out[:15]:
+        print("  %-44s %-8s %s" % ((r.get("title") or r["slug"])[:44],
+                                   r.get("id") or "?", r["slug"]))
+
+
+# ------------------------------------------------------------------ indexing
+def index_show(ref, page_size: int = 100) -> dict:
+    cid = resolve_channel(ref)
+    first = fdapi.channel_episodes(cid, 1, page_size)
     show = first.get("show") or {}
-    total = first.get("n_episodes") or 0
+    title = show.get("title") or str(cid)
+
     rows, page = [], 1
     while page <= 60:
-        d = fdapi.channel_episodes(cid, page, 20)
+        d = fdapi.channel_episodes(cid, page, page_size)
         eps = d.get("episodes") or []
         if not eps:
             break
         for e in eps:
             rows.append({
                 "channel_id": cid,
-                "show": show.get("title"),
+                "show": title,
                 "id": e.get("id"),
                 "slug": e.get("slug"),
                 "title": e.get("title"),
@@ -145,19 +187,52 @@ def cmd_index(args) -> None:
         if not d.get("has_more"):
             break
         page += 1
+
     doc = load_json(EPISODES, {})
-    doc[str(cid)] = {"show": show.get("title"), "n": total, "episodes": rows}
+    doc[str(cid)] = {"show": title, "n": first.get("n_episodes"), "episodes": rows}
     save_json(EPISODES, doc)
-    print("%s: %d episodes (api says %d)" % (show.get("title"), len(rows), total))
+    print("%-46s %3d episodes" % (title[:46], len(rows)))
+    return {"id": cid, "show": title, "n": len(rows)}
 
 
-def cmd_index_all(_args) -> None:
+def cmd_index(args) -> None:
+    index_show(args.show)
+
+
+def cmd_index_all(args) -> None:
     cat = load_json(CATALOG, [])
+    if not cat:
+        print("catalog empty — run: python fdgrab.py discover")
+        return
+    if args.limit_shows:
+        cat = cat[: args.limit_shows]
+    total = 0
     for r in cat:
         try:
-            cmd_index(argparse.Namespace(channel=r["id"] or r["slug"]))
+            info = index_show(r.get("id") or r["slug"])
+            total += info["n"]
         except Exception as e:  # noqa: BLE001
-            print("  ! %s: %s" % (r["slug"], e))
+            print("  ! %s: %s" % (r.get("slug"), e))
+    print("indexed %d episodes across %d shows" % (total, len(cat)))
+
+
+# ------------------------------------------------------------------ info
+def cmd_info(args) -> None:
+    cid = resolve_channel(args.show)
+    ch = fdapi.channel(cid)
+    d = fdapi.channel_episodes(cid, 1, 5)
+    print("title      :", ch.get("title"))
+    print("channel id :", cid)
+    print("slug       :", ch.get("slug"))
+    print("language   :", ch.get("language"))
+    print("premium    :", ch.get("is_premium"))
+    print("episodes   :", d.get("n_episodes"))
+    print("image      :", ch.get("image"))
+    eps = d.get("episodes") or []
+    for e in eps[:5]:
+        print("   E%03d  %-46s %4ss" % (e.get("index") or 0,
+                                        (e.get("title") or "")[:46],
+                                        e.get("duration_s") or 0))
 
 
 # ------------------------------------------------------------------ download
@@ -165,25 +240,28 @@ def state_path(cid) -> Path:
     return STATE / ("%s.json" % cid)
 
 
-def download(ep: dict, show_title: str) -> Path | None:
-    folder = OUT / slugify(show_title or str(ep["channel_id"]))
+def episode_url(ep: dict) -> str | None:
+    url = ep.get("hls")
+    if url:
+        return url
+    try:
+        d = fdapi.episode(ep["id"])
+        return ((d.get("content") or {}).get("hls_url"))
+    except Exception:
+        return None
+
+
+def download(ep: dict, show: str) -> tuple[str, Path | None]:
+    folder = OUT / slugify(show)
     folder.mkdir(parents=True, exist_ok=True)
     name = "E%03d_%s.mp4" % (int(ep.get("index") or 0), slugify(ep.get("title") or ""))
     dest = folder / name
     if dest.exists() and dest.stat().st_size > 200_000:
-        return dest
+        return ep["id"], dest
 
-    url = ep.get("hls")
+    url = episode_url(ep)
     if not url:
-        # the list is a summary; the per-episode call carries the manifest
-        try:
-            d = fdapi.get("/api/v2/episodes/%s/" % ep["id"])
-            url = ((d.get("episode") or d).get("content") or {}).get("hls_url")
-        except Exception:
-            url = None
-    if not url:
-        print("  ! no hls for ep %s" % ep.get("id"))
-        return None
+        return ep["id"], None
 
     tmp = dest.with_suffix(".part.mp4")
     cmd = [FFMPEG, "-y", "-v", "error",
@@ -193,11 +271,11 @@ def download(ep: dict, show_title: str) -> Path | None:
                        encoding="utf-8", errors="replace")
     if tmp.exists() and tmp.stat().st_size > 100_000:
         tmp.replace(dest)
-        return dest
-    print("  ! ffmpeg failed ep %s: %s" % (ep.get("id"), (r.stderr or "")[-200:]))
+        return ep["id"], dest
+    print("   ! ffmpeg ep %s: %s" % (ep.get("id"), (r.stderr or "")[-160:]))
     if tmp.exists():
         tmp.unlink(missing_ok=True)
-    return None
+    return ep["id"], None
 
 
 def parse_range(spec, rows):
@@ -211,37 +289,88 @@ def parse_range(spec, rows):
     return [r for r in rows if int(r.get("index") or 0) in want]
 
 
-def cmd_get(args) -> None:
-    cid = resolve_channel(args.channel)
+def grab(ref, eps=None, limit=None, all_eps=False, workers=3, force=False) -> int:
+    cid = resolve_channel(ref)
     doc = load_json(EPISODES, {})
     if str(cid) not in doc:
-        cmd_index(argparse.Namespace(channel=cid))
+        index_show(cid)
         doc = load_json(EPISODES, {})
     pack = doc.get(str(cid)) or {}
-    rows = parse_range(args.eps, pack.get("episodes") or [])
-    if args.limit:
-        rows = rows[: args.limit]
+    rows = pack.get("episodes") or []
+    if all_eps:
+        pass
+    elif eps:
+        rows = parse_range(eps, rows)
+    if limit:
+        rows = rows[:limit]
 
     st = load_json(state_path(cid), {"done": []})
     done = set(st.get("done") or [])
+    todo = [r for r in rows if force or r["id"] not in done]
+    if not todo:
+        print("%s: nothing to do" % pack.get("show"))
+        return 0
+
+    show = pack.get("show") or str(cid)
+    print("%s: %d episode(s), %d worker(s)" % (show, len(todo), workers))
     ok = 0
-    for i, ep in enumerate(rows, 1):
-        if ep["id"] in done and not args.force:
+    t0 = time.time()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(download, ep, show): ep for ep in todo}
+        for fut in concurrent.futures.as_completed(futures):
+            ep = futures[fut]
+            try:
+                eid, path = fut.result()
+            except Exception as e:  # noqa: BLE001
+                print("   ! %s: %s" % (ep.get("title"), e))
+                continue
+            if path:
+                ok += 1
+                done.add(eid)
+                st["done"] = sorted(done)
+                save_json(state_path(cid), st)
+                print("  [%d/%d] %-52s %6.1f MB" % (
+                    ok, len(todo), path.name[:52], path.stat().st_size / 1e6))
+    print("%s: %d/%d in %.0fs" % (show, ok, len(todo), time.time() - t0))
+    return ok
+
+
+def cmd_get(args) -> None:
+    grab(args.show, args.eps, args.limit, args.all, args.workers, args.force)
+
+
+def cmd_get_all(args) -> None:
+    cat = load_json(CATALOG, [])
+    if not cat:
+        print("catalog empty — run: python fdgrab.py discover")
+        return
+    if args.limit_shows:
+        cat = cat[: args.limit_shows]
+    total = 0
+    for r in cat:
+        try:
+            total += grab(r.get("id") or r["slug"], None, args.limit, args.all,
+                          args.workers, args.force)
+        except SystemExit:
             continue
-        t0 = time.time()
-        p = download(ep, pack.get("show") or str(cid))
-        if p:
-            ok += 1
-            done.add(ep["id"])
-            st["done"] = sorted(done)
-            save_json(state_path(cid), st)
-            print("[%d/%d] %s  %.1f MB  %.1fs" % (
-                i, len(rows), p.relative_to(OUT), p.stat().st_size / 1e6,
-                time.time() - t0))
-    print("downloaded %d/%d for %s" % (ok, len(rows), pack.get("show")))
+        except Exception as e:  # noqa: BLE001
+            print("  ! %s: %s" % (r.get("slug"), e))
+    print("downloaded %d episode(s) across %d show(s)" % (total, len(cat)))
 
 
-def cmd_status(_args) -> None:
+# ------------------------------------------------------------------ misc
+def cmd_search(args) -> None:
+    d = fdapi.search(args.query, args.page)
+    items = d.get("items") or []
+    print("%d result(s) for %r" % (len(items), args.query))
+    for it in items:
+        sh = it.get("show") or {}
+        print("  %-8s %-44s %3s eps  premium=%s" % (
+            sh.get("id"), (sh.get("title") or "")[:44],
+            sh.get("n_episodes"), sh.get("is_premium")))
+
+
+def cmd_status(args) -> None:
     files = list(OUT.rglob("*.mp4"))
     total = sum(f.stat().st_size for f in files)
     print("%d episodes on disk, %.2f GB" % (len(files), total / 1e9))
@@ -254,16 +383,52 @@ def cmd_status(_args) -> None:
 
 
 def main() -> None:
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(prog="fdgrab", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("catalog").set_defaults(fn=cmd_catalog)
-    i = sub.add_parser("index"); i.add_argument("channel"); i.set_defaults(fn=cmd_index)
-    sub.add_parser("index-all").set_defaults(fn=cmd_index_all)
-    g = sub.add_parser("get"); g.add_argument("channel")
-    g.add_argument("--eps"); g.add_argument("--limit", type=int)
+
+    d = sub.add_parser("discover", help="build the show catalog")
+    d.add_argument("--genres", action="store_true", help="also walk every genre")
+    d.add_argument("--max-pages", type=int, default=8)
+    d.set_defaults(fn=cmd_discover)
+
+    i = sub.add_parser("index", help="episode list for one show")
+    i.add_argument("show")
+    i.set_defaults(fn=cmd_index)
+
+    ia = sub.add_parser("index-all", help="episode lists for the whole catalog")
+    ia.add_argument("--limit-shows", type=int)
+    ia.set_defaults(fn=cmd_index_all)
+
+    inf = sub.add_parser("info", help="show details")
+    inf.add_argument("show")
+    inf.set_defaults(fn=cmd_info)
+
+    g = sub.add_parser("get", help="download one show")
+    g.add_argument("show")
+    g.add_argument("--eps", help="1-5 or 1,3,7")
+    g.add_argument("--all", action="store_true", help="every episode")
+    g.add_argument("--limit", type=int)
+    g.add_argument("--workers", type=int, default=3)
     g.add_argument("--force", action="store_true")
     g.set_defaults(fn=cmd_get)
-    sub.add_parser("status").set_defaults(fn=cmd_status)
+
+    ga = sub.add_parser("get-all", help="download every show in the catalog")
+    ga.add_argument("--limit-shows", type=int)
+    ga.add_argument("--limit", type=int, help="episodes per show")
+    ga.add_argument("--all", action="store_true")
+    ga.add_argument("--workers", type=int, default=3)
+    ga.add_argument("--force", action="store_true")
+    ga.set_defaults(fn=cmd_get_all)
+
+    s = sub.add_parser("search")
+    s.add_argument("query")
+    s.add_argument("--page", type=int, default=1)
+    s.set_defaults(fn=cmd_search)
+
+    st = sub.add_parser("status")
+    st.set_defaults(fn=cmd_status)
+
     a = p.parse_args()
     a.fn(a)
 
