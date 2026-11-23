@@ -1,0 +1,6 @@
+# No third-party Python packages are required — the client is stdlib only.
+# ffmpeg must be installed separately and present on PATH.
+#
+#   Windows : winget install Gyan.FFmpeg
+#   macOS   : brew install ffmpeg
+#   Linux   : sudo apt install ffmpeg

@@ -1,0 +1,32 @@
+# local artefacts
+out/
+state/
+dumps/
+traffic.log
+
+# generated indexes
+catalog.json
+episodes.json
+
+# secrets / session
+src/token.txt
+src/firebase_token.json
+*.log
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# editors / os
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# media
+*.mp4
+*.ts
+*.m3u8
